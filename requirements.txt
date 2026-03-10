@@ -4,3 +4,4 @@ cryptg
 standard-imghdr
 urllib3==1.26.18
 six
+setuptools
