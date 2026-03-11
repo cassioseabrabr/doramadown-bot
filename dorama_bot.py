@@ -46,7 +46,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # =============================================================================
-# HEALTHCHECK SERVER (Render Free)
+# HEALTHCHECK SERVER
 # =============================================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -68,7 +68,7 @@ def start_http_server():
 
 
 # =============================================================================
-# BANCO SIMPLES
+# BANCO LOCAL
 # =============================================================================
 
 def load_data():
@@ -211,12 +211,6 @@ async def get_client():
 # =============================================================================
 
 def parse_tg_link(text: str):
-    """
-    Aceita:
-    - https://t.me/canal/123
-    - https://t.me/c/1234567890/123
-    - https://telegram.me/canal/123
-    """
     text = text.strip()
 
     m = re.search(r"(?:t\.me|telegram\.me)/c/(\d+)/(\d+)", text)
@@ -263,9 +257,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Baixe vídeos do Telegram.\n\n"
         f"{status}\n\n"
         f"*Como usar:*\n"
-        f"1. Abra o vídeo no Telegram\n"
-        f"2. Copie o link da mensagem\n"
-        f"3. Cole aqui no bot\n\n"
+        f"1. Copie o link da mensagem no Telegram\n"
+        f"2. Cole aqui no bot\n"
+        f"3. Aguarde o download\n\n"
         f"_Exemplo:_ `https://t.me/canal/123`"
     )
 
@@ -315,8 +309,7 @@ async def cmd_ativar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🔑 *Ativar PRO*\n\n"
         "Use:\n"
         "`/serial SEU NOME | KWAI-XXXX-XXXX-XXXX`\n\n"
-        "_Exemplo:_\n"
-        "`/serial João Silva | KWAI-A1B2-C3D4-1504`",
+        "_Exemplo:_ `/serial João Silva | KWAI-A1B2-C3D4-1504`",
         parse_mode="Markdown",
     )
 
@@ -439,7 +432,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # =============================================================================
-# DOWNLOAD COM BARRA DE PROGRESSO
+# DOWNLOAD ESTÁVEL COM BARRA DE PROGRESSO
 # =============================================================================
 
 async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -494,8 +487,11 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         tamanho_mb = round(doc.size / 1024 / 1024, 1)
 
-        if tamanho_mb > 2000:
-            await status_msg.edit_text(f"❌ Arquivo muito grande ({tamanho_mb} MB).")
+        if tamanho_mb > 300:
+            await status_msg.edit_text(
+                f"❌ Vídeo muito grande ({tamanho_mb} MB).\n"
+                f"No plano atual o limite seguro é 300 MB."
+            )
             return
 
         nome_arq = f"video_{uid}_{msg_id}.mp4"
@@ -519,9 +515,8 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             percent = int((atual / total) * 100)
             agora = time.time()
 
-            # atualiza no máximo a cada 2 segundos ou a cada 5%
             if progresso["ultimo_percent"] != -1:
-                if percent - progresso["ultimo_percent"] < 5 and (agora - progresso["ultima_atualizacao"]) < 2:
+                if percent < 100 and percent - progresso["ultimo_percent"] < 10 and (agora - progresso["ultima_atualizacao"]) < 3:
                     return
 
             progresso["ultimo_percent"] = percent
@@ -553,18 +548,50 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
 
-        log.info("Starting direct file download in chunks")
-        await client.download_media(
-            msg_tg,
-            str(caminho),
-            progress_callback=progress_callback
-        )
+        baixou = False
+
+        for tentativa in range(3):
+            try:
+                log.info("Tentativa de download %s/3", tentativa + 1)
+
+                await asyncio.wait_for(
+                    client.download_media(
+                        msg_tg,
+                        str(caminho),
+                        progress_callback=progress_callback,
+                        part_size_kb=512
+                    ),
+                    timeout=900
+                )
+
+                baixou = True
+                break
+
+            except asyncio.TimeoutError:
+                log.warning("Download excedeu o tempo na tentativa %s", tentativa + 1)
+                if tentativa < 2:
+                    await status_msg.edit_text("⚠️ Conexão lenta. Tentando novamente...")
+                    await asyncio.sleep(3)
+
+            except Exception as e:
+                log.warning("Tentativa %s falhou: %s", tentativa + 1, e)
+                if tentativa < 2:
+                    await status_msg.edit_text("⚠️ Erro temporário. Tentando novamente...")
+                    await asyncio.sleep(3)
+
+        if not baixou:
+            await status_msg.edit_text(
+                "❌ O download falhou após várias tentativas.\n"
+                "Tente novamente com um vídeo menor."
+            )
+            return
 
         await status_msg.edit_text("📤 Enviando vídeo...")
 
         with open(caminho, "rb") as f:
-            await update.message.reply_video(
-                video=f,
+            await update.message.reply_document(
+                document=f,
+                filename=nome_arq,
                 caption=f"✅ *{nome_arq}*\n📦 {tamanho_mb} MB",
                 parse_mode="Markdown",
             )
