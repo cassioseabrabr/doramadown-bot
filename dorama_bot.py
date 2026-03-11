@@ -6,24 +6,23 @@ import re
 import json
 import time
 import asyncio
-import hashlib
 import logging
 import threading
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from datetime import datetime, timedelta
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
 
 from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.errors import SessionPasswordNeededError
 from telethon.tl.types import MessageMediaDocument
 
 # =============================================================================
@@ -33,11 +32,9 @@ from telethon.tl.types import MessageMediaDocument
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
-ADMIN_ID = int(os.environ["ADMIN_ID"])
-CHAVE_SECRETA = os.environ.get("CHAVE_SECRETA", "DORAMA2026KEY")
 
-LIMITE_GRATIS = 5
 DATA_FILE = Path("usuarios.json")
+DOWNLOAD_LIMIT_MB = 700
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,8 +42,15 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# guarda processo de login pendente em memória
+pending_logins = {}
+
+# cache de clientes conectados por usuário
+user_clients = {}
+
+
 # =============================================================================
-# HEALTHCHECK SERVER
+# HEALTHCHECK
 # =============================================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -68,7 +72,7 @@ def start_http_server():
 
 
 # =============================================================================
-# BANCO LOCAL
+# BANCO SIMPLES
 # =============================================================================
 
 def load_data():
@@ -87,30 +91,28 @@ def save_data(data):
     )
 
 
-def get_user(uid: int):
+def get_user_data(uid: int):
     data = load_data()
     uid = str(uid)
 
     if uid not in data:
         data[uid] = {
-            "downloads": 0,
-            "serial": None,
-            "nome_serial": None,
+            "telegram_session": None,
+            "telegram_phone": None,
         }
         save_data(data)
 
     return data[uid]
 
 
-def update_user(uid: int, **kwargs):
+def update_user_data(uid: int, **kwargs):
     data = load_data()
     uid = str(uid)
 
     if uid not in data:
         data[uid] = {
-            "downloads": 0,
-            "serial": None,
-            "nome_serial": None,
+            "telegram_session": None,
+            "telegram_phone": None,
         }
 
     data[uid].update(kwargs)
@@ -118,92 +120,43 @@ def update_user(uid: int, **kwargs):
 
 
 # =============================================================================
-# SERIAL / PRO
+# TELETHON POR USUÁRIO
 # =============================================================================
 
-def gerar_serial(nome: str, data_inicio=None):
-    if data_inicio is None:
-        data_inicio = datetime.now()
+async def get_user_client(uid: int):
+    uid_str = str(uid)
 
-    periodo = data_inicio.strftime("%Y%m%d")
-    entrada = f"{nome.upper().strip()}|{periodo}|{CHAVE_SECRETA}"
-    h = hashlib.sha256(entrada.encode()).hexdigest().upper()
-    expira = (data_inicio + timedelta(days=30)).strftime("%d%m")
-    return f"KWAI-{h[0:4]}-{h[8:12]}-{expira}"
+    if uid_str in user_clients:
+        client = user_clients[uid_str]
+        if not client.is_connected():
+            await client.connect()
+        return client
 
+    user_data = get_user_data(uid)
+    session_str = user_data.get("telegram_session")
 
-def validar_serial(nome: str, serial: str):
-    serial = serial.strip().upper()
-    partes = serial.split("-")
+    if not session_str:
+        return None
 
-    if len(partes) != 4 or partes[0] != "KWAI":
-        return False, 0, "Formato inválido"
+    client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+    await client.connect()
 
-    try:
-        ddmm = partes[3]
-        dia, mes = int(ddmm[0:2]), int(ddmm[2:4])
-        ano = datetime.now().year
-        expira = datetime(ano, mes, dia)
+    if not await client.is_user_authorized():
+        await client.disconnect()
+        return None
 
-        if expira < datetime.now() - timedelta(days=35):
-            expira = datetime(ano + 1, mes, dia)
-    except Exception:
-        return False, 0, "Data inválida"
-
-    hoje = datetime.now()
-    if expira < hoje:
-        return False, 0, f"Serial expirado há {(hoje - expira).days} dia(s)"
-
-    dias = (expira - hoje).days + 1
-
-    for delta in range(31):
-        dt = expira - timedelta(days=30) + timedelta(days=delta)
-        if gerar_serial(nome, dt) == serial:
-            return True, dias, f"Válido por {dias} dia(s)"
-
-    return False, 0, "Serial inválido"
+    user_clients[uid_str] = client
+    return client
 
 
-def is_pro(uid: int):
-    u = get_user(uid)
-    if not u.get("serial") or not u.get("nome_serial"):
-        return False, 0
-
-    ok, dias, _ = validar_serial(u["nome_serial"], u["serial"])
-    return ok, dias
-
-
-def pode_baixar(uid: int):
-    pro, dias = is_pro(uid)
-    if pro:
-        return True, f"PRO ativo — {dias} dia(s) restante(s)"
-
-    u = load_data().get(str(uid), {})
-    n = u.get("downloads", 0)
-    restantes = LIMITE_GRATIS - n
-
-    if restantes > 0:
-        return True, f"Grátis: {restantes} download(s) restante(s)"
-
-    return False, "Limite grátis atingido"
-
-
-# =============================================================================
-# TELETHON
-# =============================================================================
-
-_tg_client = None
-
-
-async def get_client():
-    global _tg_client
-
-    if _tg_client is None:
-        _tg_client = TelegramClient("sessao_bot", API_ID, API_HASH)
-        await _tg_client.start(bot_token=BOT_TOKEN)
-        log.info("Cliente Telethon iniciado")
-
-    return _tg_client
+async def disconnect_user_client(uid: int):
+    uid_str = str(uid)
+    client = user_clients.pop(uid_str, None)
+    if client:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
 
 
 # =============================================================================
@@ -213,10 +166,12 @@ async def get_client():
 def parse_tg_link(text: str):
     text = text.strip()
 
+    # links tipo t.me/c/1234567890/123
     m = re.search(r"(?:t\.me|telegram\.me)/c/(\d+)/(\d+)", text)
     if m:
         return int("-100" + m.group(1)), int(m.group(2))
 
+    # links tipo t.me/canal/123
     m = re.search(r"(?:t\.me|telegram\.me)/([^/\s]+)/(\d+)", text)
     if m:
         username = m.group(1)
@@ -240,39 +195,28 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
 
-    uid = update.effective_user.id
-    nome = update.effective_user.first_name or "amigo"
-    pro, dias = is_pro(uid)
-    u = get_user(uid)
-    restantes = max(0, LIMITE_GRATIS - u.get("downloads", 0))
-
-    if pro:
-        status = f"⭐ *PRO ativo* — {dias} dia(s) restante(s)"
-    else:
-        status = f"🆓 *Grátis* — {restantes}/{LIMITE_GRATIS} downloads restantes"
-
     texto = (
-        f"👋 Olá, *{nome}*!\n\n"
-        f"📺 *DoramaDown Bot*\n"
-        f"Baixe vídeos do Telegram.\n\n"
-        f"{status}\n\n"
-        f"*Como usar:*\n"
-        f"1. Copie o link da mensagem no Telegram\n"
-        f"2. Cole aqui no bot\n"
-        f"3. Aguarde o download\n\n"
-        f"_Exemplo:_ `https://t.me/canal/123`"
+        "👋 *Bot de Download com Conta do Próprio Usuário*\n\n"
+        "Esse modo funciona assim:\n"
+        "1. Você conecta *a sua conta do Telegram*\n"
+        "2. O bot baixa com *o acesso da sua conta*\n"
+        "3. Então funciona em canais e grupos que *você* consegue ver\n\n"
+        "*Passos:*\n"
+        "1. `/login +5511999999999`\n"
+        "2. Você recebe um código no Telegram\n"
+        "3. Envie: `/code 12345`\n"
+        "4. Se pedir 2FA, envie: `/senha SUASENHA`\n"
+        "5. Depois mande o link da mensagem\n\n"
+        "*Comandos:*\n"
+        "/start\n"
+        "/status\n"
+        "/login +55...\n"
+        "/code 12345\n"
+        "/senha SUASENHA\n"
+        "/logout"
     )
 
-    kbd = []
-    if not pro:
-        kbd.append([InlineKeyboardButton("⭐ Ativar PRO", callback_data="ativar_pro")])
-    kbd.append([InlineKeyboardButton("❓ Ajuda", callback_data="ajuda")])
-
-    await update.message.reply_text(
-        texto,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(kbd),
-    )
+    await update.message.reply_text(texto, parse_mode="Markdown")
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -280,159 +224,199 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     uid = update.effective_user.id
-    pro, dias = is_pro(uid)
-    u = get_user(uid)
-    n = u.get("downloads", 0)
+    user_data = get_user_data(uid)
 
-    if pro:
+    if user_data.get("telegram_session"):
+        phone = user_data.get("telegram_phone") or "conectado"
         await update.message.reply_text(
-            f"⭐ *Status: PRO*\n\n"
-            f"✅ Downloads ilimitados\n"
-            f"📅 Expira em: {dias} dia(s)",
-            parse_mode="Markdown",
+            f"✅ Conta conectada\n\nTelefone: `{phone}`",
+            parse_mode="Markdown"
         )
     else:
-        restantes = max(0, LIMITE_GRATIS - n)
         await update.message.reply_text(
-            f"🆓 *Status: Grátis*\n\n"
-            f"📥 Downloads usados: {n}/{LIMITE_GRATIS}\n"
-            f"📥 Restantes: {restantes}",
-            parse_mode="Markdown",
+            "❌ Nenhuma conta conectada ainda.\n\nUse `/login +5511999999999`",
+            parse_mode="Markdown"
         )
 
 
-async def cmd_ativar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-
-    await update.message.reply_text(
-        "🔑 *Ativar PRO*\n\n"
-        "Use:\n"
-        "`/serial SEU NOME | KWAI-XXXX-XXXX-XXXX`\n\n"
-        "_Exemplo:_ `/serial João Silva | KWAI-A1B2-C3D4-1504`",
-        parse_mode="Markdown",
-    )
-
-
-async def cmd_serial(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_login(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
     uid = update.effective_user.id
-    text = update.message.text.replace("/serial", "", 1).strip()
+    parts = update.message.text.split(maxsplit=1)
 
-    if "|" not in text:
+    if len(parts) < 2:
         await update.message.reply_text(
-            "❌ Formato incorreto.\n\n"
-            "Use: `/serial SEU NOME | KWAI-XXXX-XXXX-XXXX`",
-            parse_mode="Markdown",
-        )
-        return
-
-    nome, serial = [p.strip() for p in text.split("|", 1)]
-    ok, dias, msg = validar_serial(nome, serial)
-
-    if ok:
-        update_user(uid, serial=serial.upper(), nome_serial=nome.upper(), downloads=0)
-        await update.message.reply_text(
-            f"✅ *PRO ativado!*\n\n"
-            f"👤 Nome: {nome}\n"
-            f"📅 Válido por {dias} dia(s)",
-            parse_mode="Markdown",
-        )
-    else:
-        await update.message.reply_text(
-            f"❌ *Serial inválido*\n\nMotivo: {msg}",
-            parse_mode="Markdown",
-        )
-
-
-async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-
-    uid = update.effective_user.id
-    if uid != ADMIN_ID:
-        return
-
-    data = load_data()
-    total = len(data)
-    pros = sum(1 for u in data.values() if u.get("serial"))
-    dls = sum(u.get("downloads", 0) for u in data.values())
-
-    await update.message.reply_text(
-        f"📊 *Painel Admin*\n\n"
-        f"👥 Usuários: {total}\n"
-        f"⭐ PRO ativos: {pros}\n"
-        f"📥 Downloads totais: {dls}\n\n"
-        f"Use `/gerar NOME DO CLIENTE`",
-        parse_mode="Markdown",
-    )
-
-
-async def cmd_gerar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-
-    uid = update.effective_user.id
-    if uid != ADMIN_ID:
-        return
-
-    nome = update.message.text.replace("/gerar", "", 1).strip()
-    if not nome:
-        await update.message.reply_text(
-            "Use: `/gerar NOME DO CLIENTE`",
+            "Use assim:\n`/login +5511999999999`",
             parse_mode="Markdown"
         )
         return
 
-    serial = gerar_serial(nome)
-    expira = (datetime.now() + timedelta(days=30)).strftime("%d/%m/%Y")
+    phone = parts[1].strip()
 
-    await update.message.reply_text(
-        f"✅ Serial gerado para *{nome}*:\n\n"
-        f"`{serial}`\n\n"
-        f"Expira: {expira}",
-        parse_mode="Markdown",
-    )
+    try:
+        client = TelegramClient(StringSession(), API_ID, API_HASH)
+        await client.connect()
+
+        result = await client.send_code_request(phone)
+
+        pending_logins[str(uid)] = {
+            "phone": phone,
+            "phone_code_hash": result.phone_code_hash,
+            "client": client,
+        }
+
+        await update.message.reply_text(
+            "📩 Código enviado para sua conta do Telegram.\n\n"
+            "Agora envie:\n"
+            "`/code 12345`",
+            parse_mode="Markdown"
+        )
+
+    except Exception as e:
+        log.exception("Erro no login: %s", e)
+        await update.message.reply_text(
+            "❌ Não consegui iniciar o login.\n"
+            "Verifique o número e tente novamente."
+        )
 
 
-# =============================================================================
-# CALLBACKS
-# =============================================================================
-
-async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not q:
+async def cmd_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
         return
 
-    await q.answer()
+    uid = update.effective_user.id
+    parts = update.message.text.split(maxsplit=1)
 
-    if q.data == "ativar_pro":
-        await q.message.reply_text(
-            "⭐ *Ativar PRO*\n\n"
-            "Depois use:\n"
-            "`/serial SEU NOME | KWAI-XXXX-XXXX-XXXX`",
-            parse_mode="Markdown",
+    if len(parts) < 2:
+        await update.message.reply_text(
+            "Use assim:\n`/code 12345`",
+            parse_mode="Markdown"
+        )
+        return
+
+    code = parts[1].strip()
+    pending = pending_logins.get(str(uid))
+
+    if not pending:
+        await update.message.reply_text(
+            "❌ Não há login pendente.\nUse `/login +5511999999999` primeiro.",
+            parse_mode="Markdown"
+        )
+        return
+
+    client = pending["client"]
+    phone = pending["phone"]
+    phone_code_hash = pending["phone_code_hash"]
+
+    try:
+        await client.sign_in(
+            phone=phone,
+            code=code,
+            phone_code_hash=phone_code_hash
         )
 
-    elif q.data == "ajuda":
-        await q.message.reply_text(
-            "❓ *Ajuda*\n\n"
-            "1. Copie o link do vídeo no Telegram\n"
-            "2. Cole aqui no bot\n"
-            "3. Aguarde o download\n\n"
-            "*Comandos:*\n"
-            "/start\n"
-            "/status\n"
-            "/ativar\n"
-            "/serial",
-            parse_mode="Markdown",
+        session_str = client.session.save()
+        update_user_data(uid, telegram_session=session_str, telegram_phone=phone)
+
+        pending_logins.pop(str(uid), None)
+        user_clients[str(uid)] = client
+
+        await update.message.reply_text(
+            "✅ Conta conectada com sucesso!\n\n"
+            "Agora você já pode mandar o link da mensagem."
         )
+
+    except SessionPasswordNeededError:
+        await update.message.reply_text(
+            "🔐 Sua conta tem verificação em duas etapas.\n\n"
+            "Envie:\n`/senha SUA_SENHA_2FA`",
+            parse_mode="Markdown"
+        )
+
+    except Exception as e:
+        log.exception("Erro confirmando código: %s", e)
+        await update.message.reply_text(
+            "❌ Código inválido ou expirado.\n"
+            "Tente `/login` novamente."
+        )
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        pending_logins.pop(str(uid), None)
+
+
+async def cmd_senha(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
+    uid = update.effective_user.id
+    parts = update.message.text.split(maxsplit=1)
+
+    if len(parts) < 2:
+        await update.message.reply_text(
+            "Use assim:\n`/senha SUA_SENHA_2FA`",
+            parse_mode="Markdown"
+        )
+        return
+
+    senha = parts[1].strip()
+    pending = pending_logins.get(str(uid))
+
+    if not pending:
+        await update.message.reply_text(
+            "❌ Não há login pendente.\nUse `/login +5511999999999` primeiro.",
+            parse_mode="Markdown"
+        )
+        return
+
+    client = pending["client"]
+    phone = pending["phone"]
+
+    try:
+        await client.sign_in(password=senha)
+
+        session_str = client.session.save()
+        update_user_data(uid, telegram_session=session_str, telegram_phone=phone)
+
+        pending_logins.pop(str(uid), None)
+        user_clients[str(uid)] = client
+
+        await update.message.reply_text(
+            "✅ Conta conectada com sucesso!\n\n"
+            "Agora você já pode mandar o link da mensagem."
+        )
+
+    except Exception as e:
+        log.exception("Erro no 2FA: %s", e)
+        await update.message.reply_text(
+            "❌ Senha 2FA inválida."
+        )
+
+
+async def cmd_logout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    uid = update.effective_user.id
+
+    pending = pending_logins.pop(str(uid), None)
+    if pending:
+        try:
+            await pending["client"].disconnect()
+        except Exception:
+            pass
+
+    await disconnect_user_client(uid)
+    update_user_data(uid, telegram_session=None, telegram_phone=None)
+
+    await update.message.reply_text("✅ Conta desconectada.")
 
 
 # =============================================================================
-# DOWNLOAD ESTÁVEL COM BARRA DE PROGRESSO
+# DOWNLOAD
 # =============================================================================
 
 async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -444,32 +428,32 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if "t.me" not in text and "telegram.me" not in text:
         await update.message.reply_text(
-            "📎 Envie um link válido do Telegram.\n\n"
-            "_Exemplo:_ `https://t.me/canal/123`",
+            "📎 Envie um link válido de mensagem do Telegram.\n\n"
+            "Exemplo:\n`https://t.me/canal/123`",
             parse_mode="Markdown",
         )
         return
 
-    pode, _ = pode_baixar(uid)
-    if not pode:
+    client = await get_user_client(uid)
+    if not client:
         await update.message.reply_text(
-            "🚫 Você atingiu o limite grátis.\nUse /ativar para liberar o PRO.",
-            parse_mode="Markdown",
+            "❌ Você ainda não conectou sua conta.\n\n"
+            "Use `/login +5511999999999`",
+            parse_mode="Markdown"
         )
         return
 
     chat_id, msg_id = parse_tg_link(text)
     if not chat_id or not msg_id:
         await update.message.reply_text(
-            "❌ Link inválido.\nCertifique-se de copiar o link completo da mensagem.",
-            parse_mode="Markdown",
+            "❌ Link inválido.\n"
+            "Copie o link completo da mensagem."
         )
         return
 
     status_msg = await update.message.reply_text("⏳ Preparando download...")
 
     try:
-        client = await get_client()
         msg_tg = await client.get_messages(chat_id, ids=msg_id)
 
         if not msg_tg or not msg_tg.media:
@@ -487,10 +471,10 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         tamanho_mb = round(doc.size / 1024 / 1024, 1)
 
-        if tamanho_mb > 700:
+        if tamanho_mb > DOWNLOAD_LIMIT_MB:
             await status_msg.edit_text(
                 f"❌ Vídeo muito grande ({tamanho_mb} MB).\n"
-                f"No plano atual o limite seguro é 700 MB."
+                f"Limite atual: {DOWNLOAD_LIMIT_MB} MB."
             )
             return
 
@@ -552,7 +536,7 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         for tentativa in range(3):
             try:
-                log.info("Tentativa de download %s/3", tentativa + 1)
+                log.info("Tentativa de download %s/3 do usuário %s", tentativa + 1, uid)
 
                 await asyncio.wait_for(
                     client.download_media(
@@ -568,7 +552,7 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 break
 
             except asyncio.TimeoutError:
-                log.warning("Download excedeu o tempo na tentativa %s", tentativa + 1)
+                log.warning("Timeout no download, tentativa %s", tentativa + 1)
                 if tentativa < 2:
                     await status_msg.edit_text("⚠️ Conexão lenta. Tentando novamente...")
                     await asyncio.sleep(3)
@@ -582,7 +566,7 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not baixou:
             await status_msg.edit_text(
                 "❌ O download falhou após várias tentativas.\n"
-                "Tente novamente com outro vídeo ou mais tarde."
+                "Confira se sua conta realmente tem acesso ao link."
             )
             return
 
@@ -603,18 +587,12 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         await status_msg.delete()
 
-        pro, _ = is_pro(uid)
-        if not pro:
-            u = get_user(uid)
-            novos = u.get("downloads", 0) + 1
-            update_user(uid, downloads=novos)
-
     except Exception as e:
         log.exception("Erro no download: %s", e)
         try:
             await status_msg.edit_text(
                 "❌ Erro ao baixar o vídeo.\n"
-                "Confira se o link está certo e se o bot tem acesso."
+                "Confira se o link está certo e se a sua conta tem acesso."
             )
         except Exception:
             pass
@@ -631,14 +609,13 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("ativar", cmd_ativar))
-    app.add_handler(CommandHandler("serial", cmd_serial))
-    app.add_handler(CommandHandler("admin", cmd_admin))
-    app.add_handler(CommandHandler("gerar", cmd_gerar))
-    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(CommandHandler("login", cmd_login))
+    app.add_handler(CommandHandler("code", cmd_code))
+    app.add_handler(CommandHandler("senha", cmd_senha))
+    app.add_handler(CommandHandler("logout", cmd_logout))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
 
-    log.info("🤖 DoramaDown Bot iniciado!")
+    log.info("🤖 Bot iniciado no modo sessão por usuário")
     app.run_polling(drop_pending_updates=True)
 
 
