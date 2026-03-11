@@ -487,10 +487,10 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         tamanho_mb = round(doc.size / 1024 / 1024, 1)
 
-        if tamanho_mb > 500:
+        if tamanho_mb > 700:
             await status_msg.edit_text(
                 f"❌ Vídeo muito grande ({tamanho_mb} MB).\n"
-                f"No plano atual o limite seguro é 300 MB."
+                f"No plano atual o limite seguro é 700 MB."
             )
             return
 
@@ -561,7 +561,7 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         progress_callback=progress_callback,
                         part_size_kb=512
                     ),
-                    timeout=900
+                    timeout=1800
                 )
 
                 baixou = True
@@ -582,7 +582,7 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not baixou:
             await status_msg.edit_text(
                 "❌ O download falhou após várias tentativas.\n"
-                "Tente novamente com um vídeo menor."
+                "Tente novamente com outro vídeo ou mais tarde."
             )
             return
 
