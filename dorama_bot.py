@@ -487,7 +487,7 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         tamanho_mb = round(doc.size / 1024 / 1024, 1)
 
-        if tamanho_mb > 300:
+        if tamanho_mb > 500:
             await status_msg.edit_text(
                 f"❌ Vídeo muito grande ({tamanho_mb} MB).\n"
                 f"No plano atual o limite seguro é 300 MB."
